@@ -1,8 +1,13 @@
 #include "../include/lcd.h"
 #include "../include/keypad.h"
 #include "../include/timer.h"
+#include "../include/motor.h"
+#include "../include/utils.h"
+#include "../include/buzzer.h"
 
 #include <avr/io.h>
+#include <avr/interrupt.h>
+#include <avr/eeprom.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -12,85 +17,84 @@
 #define SENSOR_10BANI  PC4
 #define SENSOR_50BANI  PC3
 
-#define BUZZER_PIN PC2
+#define COIN_COOLDOWN  400
+#define PASSWORD_LEN 4
+#define STAR_HOLD_TIME 3000
 
-#define BEEP_ON_TIME   80
-#define BEEP_OFF_TIME  80
-
-void servo_init(void);
-void servo_angle(uint8_t angle);
+char detect_key(void);
+void handle_coin_flags(void);
 
 uint16_t total_bani = 0;
 
-uint8_t last_5 = 1;
-uint8_t last_10 = 1;
-uint8_t last_50 = 1;
+char password[PASSWORD_LEN + 1];
 
-uint8_t beep_active = 0;
-uint8_t beep_state = 0;
-uint8_t beep_done = 0;
-uint8_t beep_target = 0;
-uint32_t beep_last_time = 0;
+uint8_t EEMEM ee_password[PASSWORD_LEN + 1];
+uint8_t EEMEM ee_password_valid;
 
 uint8_t trapa_deschisa = 0;
 
-void buzzer_init(void) {
-    DDRC |= (1 << BUZZER_PIN);
-    PORTC &= ~(1 << BUZZER_PIN);
-}
+uint32_t last_detect_5 = 0;
+uint32_t last_detect_10 = 0;
+uint32_t last_detect_50 = 0;
 
-void buzzer_on(void) {
-    PORTC |= (1 << BUZZER_PIN);
-}
+volatile uint8_t coin5_flag = 0;
+volatile uint8_t coin10_flag = 0;
+volatile uint8_t coin50_flag = 0;
+volatile uint8_t last_pin_c = 0;
 
-void buzzer_off(void) {
-    PORTC &= ~(1 << BUZZER_PIN);
-}
+void password_load(void) {
+    uint8_t valid = eeprom_read_byte(&ee_password_valid);
 
-void buzzer_start_sound(uint8_t count) {
-    beep_target = count;
-    beep_done = 0;
-    beep_active = 1;
-    beep_state = 1;
-    beep_last_time = timer2_millis_get();
-    buzzer_on();
-}
-
-void buzzer_update(void) {
-    if (!beep_active) return;
-
-    uint32_t now = timer2_millis_get();
-
-    if (beep_state == 1) {
-        if (now - beep_last_time >= BEEP_ON_TIME) {
-            buzzer_off();
-            beep_state = 0;
-            beep_done++;
-            beep_last_time = now;
-        }
+    if (valid == 0xA5) {
+        eeprom_read_block(password, ee_password, PASSWORD_LEN + 1);
+        password[PASSWORD_LEN] = '\0';
     } else {
-        if (beep_done >= beep_target) {
-            beep_active = 0;
-            buzzer_off();
-            return;
-        }
-
-        if (now - beep_last_time >= BEEP_OFF_TIME) {
-            buzzer_on();
-            beep_state = 1;
-            beep_last_time = now;
-        }
+        strcpy(password, "3456");
+        eeprom_update_block(password, ee_password, PASSWORD_LEN + 1);
+        eeprom_update_byte(&ee_password_valid, 0xA5);
     }
 }
 
-void sensors_init(void) {
-    DDRC &= ~(1 << SENSOR_5BANI);
-    DDRC &= ~(1 << SENSOR_10BANI);
-    DDRC &= ~(1 << SENSOR_50BANI);
+void password_save(void) {
+    eeprom_update_block(password, ee_password, PASSWORD_LEN + 1);
+    eeprom_update_byte(&ee_password_valid, 0xA5);
+}
 
-    PORTC |= (1 << SENSOR_5BANI);
-    PORTC |= (1 << SENSOR_10BANI);
-    PORTC |= (1 << SENSOR_50BANI);
+void sensors_init(void) {
+    pin_input_pullup(&DDRC, &PORTC, SENSOR_5BANI);
+    pin_input_pullup(&DDRC, &PORTC, SENSOR_10BANI);
+    pin_input_pullup(&DDRC, &PORTC, SENSOR_50BANI);
+}
+
+void coin_interrupts_init(void) {
+    last_pin_c = PINC;
+
+    PCICR |= (1 << PCIE1);
+
+    PCMSK1 |= (1 << PCINT13);
+    PCMSK1 |= (1 << PCINT12);
+    PCMSK1 |= (1 << PCINT11);
+
+    sei();
+}
+
+ISR(PCINT1_vect) {
+    uint8_t current = PINC;
+    uint8_t changed = current ^ last_pin_c;
+
+    if ((changed & (1 << SENSOR_5BANI)) && !(current & (1 << SENSOR_5BANI))) {
+        coin5_flag = 1;
+    }
+
+    if ((changed & (1 << SENSOR_10BANI)) && !(current & (1 << SENSOR_10BANI))) {
+        coin10_flag = 1;
+    }
+
+    if ((changed & (1 << SENSOR_50BANI)) && !(current & (1 << SENSOR_50BANI))) {
+        coin50_flag = 1;
+    }
+
+    last_pin_c = current;
 }
 
 void lcd_print_money(uint16_t bani) {
@@ -109,45 +113,154 @@ void lcd_print_money(uint16_t bani) {
     lcd_print(buffer);
 }
 
-uint8_t wait_for_password(void) {
-    const char password[] = "3456#";
-    char input[6];
+uint8_t read_password_input(const char *message, char *out) {
     uint8_t index = 0;
 
     lcd_clear();
     lcd_set_cursor(0, 0);
-    lcd_print("Introdu parola:");
+    lcd_print(message);
     lcd_set_cursor(0, 1);
 
     while (1) {
         char key = keypad_get_key_once();
 
-        if (!key) continue;
+        buzzer_update();
+        handle_coin_flags();
 
-        input[index++] = key;
-        lcd_print("*");
+        if (!key) {
+            continue;
+        }
 
-        if (index == 5) {
-            input[index] = '\0';
+        if (key == '#') {
+            lcd_print_money(total_bani);
+            return 0;
+        }
 
-            if (strcmp(input, password) == 0) {
-                lcd_clear();
-                lcd_set_cursor(0, 0);
-                lcd_print("Parola corecta");
-                _delay_ms(1000);
+        if (key >= '0' && key <= '9') {
+            out[index++] = key;
+            lcd_print("*");
+
+            if (index == PASSWORD_LEN) {
+                out[PASSWORD_LEN] = '\0';
                 return 1;
             }
+        }
+    }
+}
 
+uint8_t wait_for_password(void) {
+    char input[PASSWORD_LEN + 1];
+
+    while (1) {
+        if (!read_password_input("Introdu parola:", input)) {
+            return 0;
+        }
+
+        if (strcmp(input, password) == 0) {
             lcd_clear();
             lcd_set_cursor(0, 0);
-            lcd_print("Parola gresita");
+            lcd_print("Parola corecta");
             _delay_ms(1000);
+            return 1;
+        }
 
-            index = 0;
-            lcd_clear();
-            lcd_set_cursor(0, 0);
-            lcd_print("Introdu parola:");
-            lcd_set_cursor(0, 1);
+        lcd_clear();
+        lcd_set_cursor(0, 0);
+        lcd_print("Parola gresita");
+        _delay_ms(1000);
+    }
+}
+
+void change_password(void) {
+    char old_pass[PASSWORD_LEN + 1];
+    char new_pass[PASSWORD_LEN + 1];
+
+    if (!read_password_input("Parola veche:", old_pass)) {
+        return;
+    }
+
+    if (strcmp(old_pass, password) != 0) {
+        lcd_clear();
+        lcd_set_cursor(0, 0);
+        lcd_print("Parola gresita");
+        _delay_ms(1000);
+        lcd_print_money(total_bani);
+        return;
+    }
+
+    if (!read_password_input("Parola noua:", new_pass)) {
+        return;
+    }
+
+    strcpy(password, new_pass);
+    password_save();
+
+    lcd_clear();
+    lcd_set_cursor(0, 0);
+    lcd_print("Parola schimbata");
+    _delay_ms(1000);
+
+    lcd_print_money(total_bani);
+}
+
+void check_star_hold(void) {
+    static uint8_t star_pressed = 0;
+    static uint8_t already_triggered = 0;
+    static uint32_t start_time = 0;
+
+    char key = detect_key();
+    uint32_t now = timer2_millis_get();
+
+    if (key == '*') {
+        if (!star_pressed) {
+            star_pressed = 1;
+            already_triggered = 0;
+            start_time = now;
+        }
+
+        if (!already_triggered && now - start_time >= STAR_HOLD_TIME) {
+            already_triggered = 1;
+            change_password();
+        }
+    } else {
+        star_pressed = 0;
+        already_triggered = 0;
+    }
+}
+
+void handle_coin_flags(void) {
+    uint32_t now = timer2_millis_get();
+
+    if (coin5_flag) {
+        coin5_flag = 0;
+
+        if (trapa_deschisa == 0 && now - last_detect_5 >= COIN_COOLDOWN) {
+            last_detect_5 = now;
+            total_bani += 5;
+            lcd_print_money(total_bani);
+            buzzer_start_sound(1);
+        }
+    }
+
+    if (coin10_flag) {
+        coin10_flag = 0;
+
+        if (trapa_deschisa == 0 && now - last_detect_10 >= COIN_COOLDOWN) {
+            last_detect_10 = now;
+            total_bani += 10;
+            lcd_print_money(total_bani);
+            buzzer_start_sound(2);
+        }
+    }
+
+    if (coin50_flag) {
+        coin50_flag = 0;
+
+        if (trapa_deschisa == 0 && now - last_detect_50 >= COIN_COOLDOWN) {
+            last_detect_50 = now;
+            total_bani += 50;
+            lcd_print_money(total_bani);
+            buzzer_start_sound(3);
         }
     }
 }
@@ -157,11 +270,13 @@ int main(void) {
     keypad_init();
     sensors_init();
     buzzer_init();
-
     timer2_init();
 
     servo_init();
     servo_angle(0);
+
+    coin_interrupts_init();
+    password_load();
 
     lcd_print_money(total_bani);
 
@@ -170,17 +285,17 @@ int main(void) {
 
         if (key == '#') {
             if (trapa_deschisa == 0) {
-                wait_for_password();
+                if (wait_for_password()) {
+                    servo_angle(180);
+                    trapa_deschisa = 1;
 
-                servo_angle(180);
-                trapa_deschisa = 1;
+                    lcd_clear();
+                    lcd_set_cursor(0, 0);
+                    lcd_print("Trapa deschisa");
+                    _delay_ms(1000);
 
-                lcd_clear();
-                lcd_set_cursor(0, 0);
-                lcd_print("Trapa deschisa");
-                _delay_ms(1000);
-
-                lcd_print_money(total_bani);
+                    lcd_print_money(total_bani);
+                }
             } else {
                 servo_angle(0);
                 trapa_deschisa = 0;
@@ -194,34 +309,8 @@ int main(void) {
             }
         }
 
-        if (trapa_deschisa == 0) {
-            uint8_t current_5 = (PINC & (1 << SENSOR_5BANI)) ? 1 : 0;
-            uint8_t current_10 = (PINC & (1 << SENSOR_10BANI)) ? 1 : 0;
-            uint8_t current_50 = (PINC & (1 << SENSOR_50BANI)) ? 1 : 0;
-
-            if (last_5 == 1 && current_5 == 0) {
-                total_bani += 5;
-                lcd_print_money(total_bani);
-                buzzer_start_sound(1);
-            }
-
-            if (last_10 == 1 && current_10 == 0) {
-                total_bani += 10;
-                lcd_print_money(total_bani);
-                buzzer_start_sound(2);
-            }
-
-            if (last_50 == 1 && current_50 == 0) {
-                total_bani += 50;
-                lcd_print_money(total_bani);
-                buzzer_start_sound(3);
-            }
-
-            last_5 = current_5;
-            last_10 = current_10;
-            last_50 = current_50;
-        }
-
+        check_star_hold();
+        handle_coin_flags();
         buzzer_update();
 
         _delay_ms(1);
