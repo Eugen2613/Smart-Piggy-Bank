@@ -4,6 +4,7 @@
 #include "../include/motor.h"
 #include "../include/utils.h"
 #include "../include/buzzer.h"
+#include "../include/save_load.h"
 
 #include <avr/io.h>
 #include <avr/interrupt.h>
@@ -12,6 +13,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <util/delay.h>
+#include <stdlib.h>
 
 #define SENSOR_5BANI   PC5
 #define SENSOR_10BANI  PC4
@@ -28,9 +30,6 @@ uint16_t total_bani = 0;
 
 char password[PASSWORD_LEN + 1];
 
-uint8_t EEMEM ee_password[PASSWORD_LEN + 1];
-uint8_t EEMEM ee_password_valid;
-
 uint8_t trapa_deschisa = 0;
 
 uint32_t last_detect_5 = 0;
@@ -41,24 +40,6 @@ volatile uint8_t coin5_flag = 0;
 volatile uint8_t coin10_flag = 0;
 volatile uint8_t coin50_flag = 0;
 volatile uint8_t last_pin_c = 0;
-
-void password_load(void) {
-    uint8_t valid = eeprom_read_byte(&ee_password_valid);
-
-    if (valid == 0xA5) {
-        eeprom_read_block(password, ee_password, PASSWORD_LEN + 1);
-        password[PASSWORD_LEN] = '\0';
-    } else {
-        strcpy(password, "3456");
-        eeprom_update_block(password, ee_password, PASSWORD_LEN + 1);
-        eeprom_update_byte(&ee_password_valid, 0xA5);
-    }
-}
-
-void password_save(void) {
-    eeprom_update_block(password, ee_password, PASSWORD_LEN + 1);
-    eeprom_update_byte(&ee_password_valid, 0xA5);
-}
 
 void sensors_init(void) {
     pin_input_pullup(&DDRC, &PORTC, SENSOR_5BANI);
@@ -148,6 +129,77 @@ uint8_t read_password_input(const char *message, char *out) {
     }
 }
 
+uint8_t read_money_input(const char *message, uint16_t *value) {
+    char buffer[6];
+    uint8_t index = 0;
+
+    lcd_clear();
+    lcd_set_cursor(0, 0);
+    lcd_print(message);
+    lcd_set_cursor(0, 1);
+
+    while (1) {
+        char key = keypad_get_key_once();
+
+        buzzer_update();
+
+        if (!key) {
+            continue;
+        }
+
+        if (key == '#') {
+            lcd_print_money(total_bani);
+            return 0;
+        }
+
+        if (key == '*') {
+            if (index == 0) {
+                continue;
+            }
+
+            buffer[index] = '\0';
+            *value = (uint16_t)atoi(buffer);
+            return 1;
+        }
+
+        if (key >= '0' && key <= '9' && index < 5) {
+            buffer[index++] = key;
+            lcd_data(key);
+        }
+    }
+}
+
+void withdraw_money(void) {
+    uint16_t scos = 0;
+
+    if (!trapa_deschisa) {
+        return;
+    }
+
+    if (!read_money_input("Suma scoasa:", &scos)) {
+        return;
+    }
+
+    if (scos > total_bani) {
+        lcd_clear();
+        lcd_set_cursor(0, 0);
+        lcd_print("Suma prea mare");
+        _delay_ms(1000);
+        lcd_print_money(total_bani);
+        return;
+    }
+
+    total_bani -= scos;
+    total_save(total_bani);
+
+    lcd_clear();
+    lcd_set_cursor(0, 0);
+    lcd_print("Suma modificata");
+    _delay_ms(1000);
+
+    lcd_print_money(total_bani);
+}
+
 uint8_t wait_for_password(void) {
     char input[PASSWORD_LEN + 1];
 
@@ -193,7 +245,7 @@ void change_password(void) {
     }
 
     strcpy(password, new_pass);
-    password_save();
+    password_save(password);
 
     lcd_clear();
     lcd_set_cursor(0, 0);
@@ -210,6 +262,12 @@ void check_star_hold(void) {
 
     char key = detect_key();
     uint32_t now = timer2_millis_get();
+
+    if (trapa_deschisa) {
+        star_pressed = 0;
+        already_triggered = 0;
+        return;
+    }
 
     if (key == '*') {
         if (!star_pressed) {
@@ -237,6 +295,7 @@ void handle_coin_flags(void) {
         if (trapa_deschisa == 0 && now - last_detect_5 >= COIN_COOLDOWN) {
             last_detect_5 = now;
             total_bani += 5;
+            total_save(total_bani);
             lcd_print_money(total_bani);
             buzzer_start_sound(1);
         }
@@ -248,6 +307,7 @@ void handle_coin_flags(void) {
         if (trapa_deschisa == 0 && now - last_detect_10 >= COIN_COOLDOWN) {
             last_detect_10 = now;
             total_bani += 10;
+            total_save(total_bani);
             lcd_print_money(total_bani);
             buzzer_start_sound(2);
         }
@@ -259,6 +319,7 @@ void handle_coin_flags(void) {
         if (trapa_deschisa == 0 && now - last_detect_50 >= COIN_COOLDOWN) {
             last_detect_50 = now;
             total_bani += 50;
+            total_save(total_bani);
             lcd_print_money(total_bani);
             buzzer_start_sound(3);
         }
@@ -276,7 +337,8 @@ int main(void) {
     servo_angle(0);
 
     coin_interrupts_init();
-    password_load();
+    password_load(password);
+    total_load(&total_bani);
 
     lcd_print_money(total_bani);
 
@@ -307,6 +369,10 @@ int main(void) {
 
                 lcd_print_money(total_bani);
             }
+        }
+
+        if (key == '*' && trapa_deschisa) {
+            withdraw_money();
         }
 
         check_star_hold();
